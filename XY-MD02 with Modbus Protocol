@@ -1,1 +1,191 @@
+/* main.c
+   Modbus RTU master for XY-MD02 (ESP-IDF)
+   - Matches MicroPython behaviour:
+     * UART(2), baud 9600, tx=18 rx=17
+     * Function 0x04 (Read Input Registers)
+     * Flush before & after send
+     * 300 ms wait after TX before reading
+     * Strict length check: expected_len = 5 + 2*qty
+     * CRC LSB-first (0xA001)
+     * AUTO_DE = 1 (do not toggle DE pin)
+*/
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+static const char *TAG = "modbus_xy_md02";
+
+/* --- HW / protocol config --- */
+#define UART_PORT_NUM   UART_NUM_2   /* match MicroPython UART(2) */
+#define TXD_PIN         18           /* MicroPy used tx=18 */
+#define RXD_PIN         17           /* MicroPy used rx=17 */
+/* DE pin left defined but not toggled since AUTO_DE=1 (auto-direction transceiver) */
+#define DE_PIN          4
+#define AUTO_DE         1            /* 1 => do not toggle DE, 0 => manual DE control */
+
+#define BAUD_RATE       9600
+
+/* Modbus specifics (match the MicroPython script) */
+#define SLAVE_ID        0x01
+#define FUNC_READ       0x04         /* Read Input Registers (MicroPy used 0x04) */
+#define REG_TEMP        0x0001
+#define REG_QTY         0x0002       /* read 2 registers (temp + humidity) */
+
+#define UART_RX_BUF_SZ  1024
+#define UART_TX_BUF_SZ  256
+
+/* CRC16 (modbus) LSB-first polynomial 0xA001 */
+static uint16_t modbus_crc16(const uint8_t *buf, int len)
+{
+    uint16_t crc = 0xFFFF;
+    for (int pos = 0; pos < len; pos++) {
+        crc ^= (uint16_t)buf[pos];
+        for (int i = 0; i < 8; i++) {
+            if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+/* If DE is manual, provide functions; when AUTO_DE==1 they are no-ops */
+#if !AUTO_DE
+static inline void rs485_set_tx(void) { gpio_set_level(DE_PIN, 1); }
+static inline void rs485_set_rx(void) { gpio_set_level(DE_PIN, 0); }
+#else
+static inline void rs485_set_tx(void) { (void)0; }
+static inline void rs485_set_rx(void) { (void)0; }
+#endif
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting Modbus master (XY-MD02) - UART2 tx=%d rx=%d", TXD_PIN, RXD_PIN);
+
+#if !AUTO_DE
+    /* configure DE pin only if manual control is used */
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << DE_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    rs485_set_rx();
+#else
+    ESP_LOGI(TAG, "AUTO_DE=1 -> not toggling DE (transceiver is auto-direction)");
+#endif
+
+    /* UART config */
+    uart_config_t uart_cfg = {
+        .baud_rate = BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_RX_BUF_SZ, UART_TX_BUF_SZ, 0, NULL, 0));
+    uart_set_rx_timeout(UART_PORT_NUM, 10); /* shorter idle timeout */
+
+    vTaskDelay(pdMS_TO_TICKS(100)); /* small startup delay */
+
+    uint8_t req[8];
+    uint8_t resp[256];
+
+    while (1) {
+        /* Build request: [slave][func][addrHi][addrLo][qtyHi][qtyLo][crcLo][crcHi] */
+        req[0] = SLAVE_ID;
+        req[1] = FUNC_READ;
+        req[2] = (REG_TEMP >> 8) & 0xFF;
+        req[3] = REG_TEMP & 0xFF;
+        req[4] = (REG_QTY >> 8) & 0xFF;
+        req[5] = REG_QTY & 0xFF;
+        uint16_t crc = modbus_crc16(req, 6);
+        req[6] = crc & 0xFF;            /* CRC low (LSB) */
+        req[7] = (crc >> 8) & 0xFF;     /* CRC high (MSB) */
+
+        ESP_LOGI(TAG, "Sending request: slave=0x%02X func=0x%02X start=0x%04X qty=%d",
+                 SLAVE_ID, FUNC_READ, REG_TEMP, (int)REG_QTY);
+
+        /* flush any old bytes before sending (mirrors MicroPython's uart.read() flush) */
+        uart_flush_input(UART_PORT_NUM);
+
+        /* If manual DE: assert TX */
+        rs485_set_tx();
+        if (!AUTO_DE) esp_rom_delay_us(200); /* brief settle if manual DE */
+
+        /* Write request */
+        int written = uart_write_bytes(UART_PORT_NUM, (const char*)req, sizeof(req));
+        uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(500)); /* wait for TX to complete */
+
+        /* flush after transmit (mirror MicroPy uart.read() after sending) */
+        uart_flush_input(UART_PORT_NUM);
+
+        /* If manual DE: deassert TX -> RX and small safety delay */
+        if (!AUTO_DE) {
+            esp_rom_delay_us(200);
+            rs485_set_rx();
+        }
+
+        /* Wait *300 ms* before reading response (MicroPy uses 300 ms) */
+        vTaskDelay(pdMS_TO_TICKS(300));
+
+        /* expected length: slave + func + byte_count + data + CRC(2) */
+        int expected_len = 5 + 2 * REG_QTY;
+
+        memset(resp, 0, sizeof(resp));
+        int len = uart_read_bytes(UART_PORT_NUM, resp, expected_len, pdMS_TO_TICKS(600));
+        if (len <= 0) {
+            ESP_LOGW(TAG, "No response (len=%d). Check wiring, slave ID, function, and registers.", len);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Received %d bytes", len);
+        ESP_LOG_BUFFER_HEX(TAG, resp, len);
+
+        /* Strict length check (same as MicroPython expects exact 5 + 2*count) */
+        if (len != expected_len) {
+            ESP_LOGW(TAG, "Invalid response length: got=%d expected=%d", len, expected_len);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            continue;
+        }
+
+        /* CRC validation */
+        uint16_t rec_crc = (uint16_t)resp[len - 2] | ((uint16_t)resp[len - 1] << 8);
+        uint16_t calc_crc = modbus_crc16(resp, len - 2);
+        if (rec_crc != calc_crc) {
+            ESP_LOGW(TAG, "CRC mismatch rec=0x%04X calc=0x%04X", rec_crc, calc_crc);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            continue;
+        }
+
+        /* Modbus exception check */
+        if ((resp[1] & 0x80) != 0) {
+            uint8_t exc = resp[2];
+            ESP_LOGW(TAG, "Modbus exception code 0x%02X", exc);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            continue;
+        }
+
+        /* parse data: registers start at resp[3], each register big-endian */
+        uint16_t temp_raw = ((uint16_t)resp[3] << 8) | resp[4];
+        uint16_t hum_raw  = ((uint16_t)resp[5] << 8) | resp[6];
+        float temp = temp_raw / 10.0f;
+        float hum  = hum_raw  / 10.0f;
+        ESP_LOGI(TAG, "Temperature: %.2f °C, Humidity: %.2f %%", temp, hum);
+
+        vTaskDelay(pdMS_TO_TICKS(2000)); /* poll interval */
+    } /* while */
+}
 
