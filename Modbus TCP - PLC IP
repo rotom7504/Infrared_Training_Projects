@@ -1,1 +1,360 @@
+main.c
+#include <stdio.h>
+#include <stdint.h>
+#include "wifi_connect.h"
+#include "modbus_read.h"     // <- add this
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+static const char *TAG = "MAIN";
+
+void app_main(void)
+{
+    const char *ssid = "Infrared_4G";
+    const char *pass = "6350307882";
+
+    ESP_LOGI(TAG, "Starting WiFi...");
+    wifi_init_sta(ssid, pass);
+
+    /* start the modbus polling task (it waits for IP internally) */
+    start_modbus_reader();
+
+    /* main loop */
+    while (1) {
+        ESP_LOGI(TAG, "Main task alive");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+wifi_connect.c
+#include "wifi_connect.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include <string.h>
+
+static const char *TAG = "WiFi";
+
+// WiFi event handler (handles connect, disconnect, got IP etc.)
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi Started → Connecting...");
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Disconnected from WiFi → Retrying...");
+        esp_wifi_connect();
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+esp_err_t wifi_init_sta(const char *ssid, const char *password)
+{
+    ESP_LOGI(TAG, "Initializing WiFi...");
+
+    // Initialize NVS (required for WiFi)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Init network interface
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
+
+    // WiFi init config
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    // Register WiFi + IP event handler
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    // WiFi Configuration
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+
+    // Set WiFi mode to station (client)
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi initialization finished.");
+
+    return ESP_OK;
+}
+
+ modbus_read.c
+/*
+  modbus_read.c
+  Modbus TCP poller (ESP-IDF v5.x compatible).
+  - waits until WiFi has IP
+  - connects to PLC IP:PORT via TCP
+  - sends Modbus TCP Read Holding Registers (0x03)
+  - prints raw uint16 register values
+  - tries UNIT_ID sequence [255, 1] automatically if no response
+*/
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <errno.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_log.h"
+#include "esp_netif.h"
+
+static const char *TAG = "MODBUS";
+
+/* --- CONFIGURE THESE for your PLC --- */
+#define PLC_IP      "192.168.1.10"   /* change to your PLC IP if needed */
+#define PLC_PORT    502
+/* We'll try these unit ids in order until we get a response */
+static const uint8_t try_unit_ids[] = { 255, 1 };
+#define START_ADDR  0                /* 0-based starting address (40001 -> 0) */
+#define QTY         40               /* how many registers to read */
+#define POLL_MS     1000             /* poll interval ms */
+
+/* Build MBAP + PDU for Read Holding Registers (0x03) given unit id */
+static int build_modbus_read_req(uint8_t *buf, uint16_t trans_id, uint8_t unit,
+                                 uint16_t start_addr, uint16_t qty)
+{
+    uint16_t protocol = 0;
+    uint16_t length = 6; /* unit + func + addr(2) + qty(2) */
+
+    buf[0] = (trans_id >> 8) & 0xFF;
+    buf[1] = trans_id & 0xFF;
+    buf[2] = (protocol >> 8) & 0xFF;
+    buf[3] = protocol & 0xFF;
+    buf[4] = (length >> 8) & 0xFF;
+    buf[5] = length & 0xFF;
+    buf[6] = unit;
+        buf[7] = 0x04; /* function code: read holding registers */
+    buf[8] = (start_addr >> 8) & 0xFF;
+    buf[9] = start_addr & 0xFF;
+    buf[10] = (qty >> 8) & 0xFF;
+    buf[11] = qty & 0xFF;
+    return 12;
+}
+
+/* Wait until an ESP netif has a non-zero IPv4 address */
+static void wait_for_ip(void)
+{
+    esp_netif_ip_info_t info;
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+    while (1) {
+        bool got_ip = false;
+
+        if (sta_netif) {
+            if (esp_netif_get_ip_info(sta_netif, &info) == ESP_OK) {
+                if (info.ip.addr != 0) {
+                    ESP_LOGI(TAG, "Detected IP: " IPSTR, IP2STR(&info.ip));
+                    got_ip = true;
+                }
+            }
+        } else {
+            /* fallback: iterate netifs and check for ip */
+            esp_netif_t *it = esp_netif_next(NULL);
+            while (it) {
+                if (esp_netif_get_ip_info(it, &info) == ESP_OK) {
+                    if (info.ip.addr != 0) {
+                        ESP_LOGI(TAG, "Detected IP (fallback): " IPSTR, IP2STR(&info.ip));
+                        got_ip = true;
+                        break;
+                    }
+                }
+                it = esp_netif_next(it);
+            }
+        }
+
+        if (got_ip) break;
+        ESP_LOGI(TAG, "Waiting for IP...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* Connect to PLC using POSIX sockets (TCP) */
+static int connect_to_plc(void)
+{
+    struct sockaddr_in dest_addr;
+    int sock = -1;
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Failed to create socket: errno=%d", errno);
+        return -1;
+    }
+
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(PLC_PORT);
+    if (inet_pton(AF_INET, PLC_IP, &dest_addr.sin_addr) <= 0) {
+        ESP_LOGE(TAG, "inet_pton failed for %s", PLC_IP);
+        close(sock);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Connecting to %s:%d ...", PLC_IP, PLC_PORT);
+    if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
+        ESP_LOGE(TAG, "Connect failed: errno=%d", errno);
+        close(sock);
+        return -1;
+    }
+
+    /* set receive timeout */
+    struct timeval tv;
+    tv.tv_sec = 3; tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    ESP_LOGI(TAG, "Connected to PLC");
+    return sock;
+}
+
+/* Try to poll using the specified unit id once.
+   Returns 0 on OK (response received and printed), negative on failure. */
+static int poll_with_unit_id(uint8_t unit)
+{
+    static uint16_t trans_id = 1; /* keep transaction id across calls */
+    uint8_t req[256];
+    uint8_t rsp[512];
+
+    int sock = connect_to_plc();
+    if (sock < 0) return -1;
+
+    int req_len = build_modbus_read_req(req, trans_id++, unit, START_ADDR, QTY);
+    int sent = send(sock, req, req_len, 0);
+    if (sent != req_len) {
+        ESP_LOGE(TAG, "Send failed (sent=%d req_len=%d) errno=%d", sent, req_len, errno);
+        close(sock);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Sent request (unit=%u TID=%u) start=%u qty=%u", unit, trans_id-1, START_ADDR, QTY);
+
+    int r = recv(sock, rsp, sizeof(rsp), 0);
+    if (r <= 0) {
+        ESP_LOGW(TAG, "No response for unit %u (recv=%d errno=%d)", unit, r, errno);
+        close(sock);
+        return -1;
+    }
+
+    if (r < 9) {
+        ESP_LOGE(TAG, "Short response (r=%d)", r);
+        close(sock);
+        return -1;
+    }
+
+    uint16_t rx_tid = (rsp[0] << 8) | rsp[1];
+    uint8_t rx_unit = rsp[6];
+    uint8_t func    = rsp[7];
+
+    if ((func & 0x80) != 0) {
+        uint8_t excode = rsp[8];
+        ESP_LOGE(TAG, "Modbus exception from unit %u (code=%d)", unit, excode);
+        close(sock);
+        return -1;
+    }
+
+    uint8_t byte_count = rsp[8];
+    int reg_count = byte_count / 2;
+    ESP_LOGI(TAG, "Response TID=%u Unit=%u Func=0x%02x Bytes=%u Regs=%d", rx_tid, rx_unit, func, byte_count, reg_count);
+
+    for (int i = 0; i < reg_count; ++i) {
+        uint16_t val = (rsp[9 + i*2] << 8) | (rsp[9 + i*2 + 1]);
+        ESP_LOGI(TAG, "Reg[%u] = %u (0x%04X)", START_ADDR + i, val, val);
+    }
+
+    close(sock);
+    return 0;
+}
+
+/* Modbus polling task - tries unit ids in try_unit_ids[] each cycle */
+static void modbus_task(void *pv)
+{
+    wait_for_ip();
+
+    while (1) {
+        bool success = false;
+        for (size_t k = 0; k < sizeof(try_unit_ids)/sizeof(try_unit_ids[0]); ++k) {
+            uint8_t unit = try_unit_ids[k];
+            if (poll_with_unit_id(unit) == 0) {
+                success = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200)); // small pause before next try
+        }
+
+        if (!success) {
+            ESP_LOGW(TAG, "No unit responded. Will retry entire sequence in 2s.");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS)); /* normal poll interval */
+    }
+}
+
+/* public starter (call from main.c) */
+void start_modbus_reader(void)
+{
+    xTaskCreate(modbus_task, "modbus_task", 8 * 1024, NULL, 5, NULL);
+}
+
+wifi_connect.h
+#ifndef WIFI_CONNECT_H
+#define WIFI_CONNECT_H
+
+#include "esp_err.h"
+
+// Connect to WiFi in station mode (STA). Returns ESP_OK on success.
+// This function starts WiFi and returns immediately; IP event prints when got IP.
+esp_err_t wifi_init_sta(const char *ssid, const char *password);
+
+#endif // WIFI_CONNECT_H
+
+ modbus_read.h
+// modbus_read.h
+#pragma once
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void start_modbus_reader(void);
+
+#ifdef __cplusplus
+}
+#endif
