@@ -1,0 +1,673 @@
+main.c
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
+#include "lwip/apps/sntp.h"
+
+#include "wifi_connect.h"
+#include "ds1307.h"
+
+static const char *TAG = "MAIN";
+
+#define NVS_NAMESPACE_TIME  "time_store"
+#define NVS_KEY_UNIX_TIME   "last_unix"
+
+static esp_err_t nvs_init_safe(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "NVS init OK");
+    } else {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static void initialize_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
+}
+
+static esp_err_t obtain_time_via_sntp(void)
+{
+    initialize_sntp();
+
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    int retry = 0;
+    const int retry_count = 10;
+
+    while (retry < retry_count) {
+        time(&now);
+        localtime_r(&now, &timeinfo);
+
+        // treat year >= 2024 as "valid" SNTP time
+        if ((timeinfo.tm_year + 1900) >= 2024) {
+            ESP_LOGI(TAG, "SNTP time: %04d-%02d-%02d %02d:%02d:%02d (Unix: %ld)",
+                     timeinfo.tm_year + 1900,
+                     timeinfo.tm_mon + 1,
+                     timeinfo.tm_mday,
+                     timeinfo.tm_hour,
+                     timeinfo.tm_min,
+                     timeinfo.tm_sec,
+                     (long)now);
+            return ESP_OK;
+        }
+
+        ESP_LOGI(TAG, "Waiting for SNTP time... (%d/%d)", retry + 1, retry_count);
+        retry++;
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    ESP_LOGW(TAG, "SNTP sync did not complete in time");
+    return ESP_FAIL;
+}
+
+static esp_err_t set_system_time_from_tm(const struct tm *timeinfo)
+{
+    if (!timeinfo) return ESP_ERR_INVALID_ARG;
+
+    time_t now = mktime((struct tm *)timeinfo);
+    if (now == (time_t)-1) {
+        ESP_LOGE(TAG, "mktime failed");
+        return ESP_FAIL;
+    }
+
+    struct timeval tv = {
+        .tv_sec = now,
+        .tv_usec = 0
+    };
+    settimeofday(&tv, NULL);
+
+    ESP_LOGI(TAG, "System time set from struct tm: %04d-%02d-%02d %02d:%02d:%02d (Unix: %ld)",
+             timeinfo->tm_year + 1900,
+             timeinfo->tm_mon + 1,
+             timeinfo->tm_mday,
+             timeinfo->tm_hour,
+             timeinfo->tm_min,
+             timeinfo->tm_sec,
+             (long)now);
+
+    return ESP_OK;
+}
+
+static esp_err_t set_system_time_from_unix(time_t unix_time)
+{
+    if (unix_time <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    struct timeval tv = {
+        .tv_sec = unix_time,
+        .tv_usec = 0
+    };
+    settimeofday(&tv, NULL);
+
+    struct tm timeinfo;
+    localtime_r(&unix_time, &timeinfo);
+
+    ESP_LOGI(TAG, "System time set from NVS Unix: %04d-%02d-%02d %02d:%02d:%02d (Unix: %ld)",
+             timeinfo.tm_year + 1900,
+             timeinfo.tm_mon + 1,
+             timeinfo.tm_mday,
+             timeinfo.tm_hour,
+             timeinfo.tm_min,
+             timeinfo.tm_sec,
+             (long)unix_time);
+
+    return ESP_OK;
+}
+
+static esp_err_t nvs_save_unix_time(time_t unix_time)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_TIME, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_i64(nvs, NVS_KEY_UNIX_TIME, (int64_t)unix_time);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_set_i64 failed: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_commit failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Saved Unix time %ld to NVS", (long)unix_time);
+    return ESP_OK;
+}
+
+static esp_err_t nvs_load_unix_time(time_t *unix_time_out)
+{
+    if (!unix_time_out) return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_TIME, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No NVS time namespace yet");
+        return err;
+    }
+
+    int64_t stored = 0;
+    err = nvs_get_i64(nvs, NVS_KEY_UNIX_TIME, &stored);
+    nvs_close(nvs);
+
+    if (err == ESP_OK) {
+        *unix_time_out = (time_t)stored;
+        ESP_LOGI(TAG, "Loaded Unix time %ld from NVS", (long)*unix_time_out);
+    } else {
+        ESP_LOGI(TAG, "No valid time in NVS (key missing)");
+    }
+
+    return err;
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "System start");
+
+    // 1) NVS init
+    nvs_init_safe();
+
+    // 2) Try DS1307 as primary source
+    bool rtc_ok = false;
+    struct tm rtc_time = {0};
+
+    esp_err_t err_rtc_init = ds1307_init();
+    if (err_rtc_init == ESP_OK) {
+        err_rtc_init = ds1307_get_time(&rtc_time);
+        if (err_rtc_init == ESP_OK) {
+            int year = rtc_time.tm_year + 1900;
+            if (year >= 2024) {
+                rtc_ok = true;
+                ESP_LOGI(TAG,
+                         "Valid DS1307 time at boot: %04d-%02d-%02d %02d:%02d:%02d",
+                         year,
+                         rtc_time.tm_mon + 1,
+                         rtc_time.tm_mday,
+                         rtc_time.tm_hour,
+                         rtc_time.tm_min,
+                         rtc_time.tm_sec);
+                set_system_time_from_tm(&rtc_time);
+            } else {
+                ESP_LOGW(TAG, "DS1307 time looks invalid (year=%d)", year);
+            }
+        } else {
+            ESP_LOGW(TAG, "DS1307 read failed at boot: %s", esp_err_to_name(err_rtc_init));
+        }
+    } else {
+        ESP_LOGW(TAG, "DS1307 init failed at boot: %s", esp_err_to_name(err_rtc_init));
+    }
+
+    // 3) If DS1307 invalid, try NVS
+    bool nvs_time_ok = false;
+    time_t nvs_unix = 0;
+
+    if (!rtc_ok) {
+        ESP_LOGW(TAG, "No valid DS1307 time at boot, trying NVS");
+        if (nvs_load_unix_time(&nvs_unix) == ESP_OK && nvs_unix > 0) {
+            nvs_time_ok = true;
+            set_system_time_from_unix(nvs_unix);
+        } else {
+            ESP_LOGW(TAG, "No valid time in NVS either. WiFi + SNTP required.");
+        }
+    }
+
+    // 4) If both DS1307 and NVS invalid, use WiFi + SNTP once
+    if (!rtc_ok && !nvs_time_ok) {
+        ESP_LOGI(TAG, "Starting WiFi for initial SNTP sync...");
+        wifi_init_sta();   // your existing WiFi code
+
+        if (obtain_time_via_sntp() == ESP_OK) {
+            time_t now;
+            time(&now);
+
+            // Save to NVS
+            nvs_save_unix_time(now);
+
+            // Also seed DS1307 if it initialized OK
+            if (ds1307_init() == ESP_OK) {
+                struct tm timeinfo;
+                localtime_r(&now, &timeinfo);
+                ds1307_set_time(&timeinfo);
+            }
+        } else {
+            ESP_LOGW(TAG, "SNTP time not obtained, system time may be invalid");
+        }
+    } else if (rtc_ok) {
+        // DS1307 was valid at boot, also keep NVS in sync
+        time_t now = mktime(&rtc_time);
+        if (now > 0) {
+            nvs_save_unix_time(now);
+        }
+    } else if (nvs_time_ok) {
+        // NVS used at boot; try to also update DS1307
+        if (ds1307_init() == ESP_OK) {
+            struct tm timeinfo;
+            localtime_r(&nvs_unix, &timeinfo);
+            ds1307_set_time(&timeinfo);
+        }
+    }
+
+    // 5) Main loop: heartbeat + periodic NVS backup
+    int heartbeat = 0;
+    int nvs_counter = 0;  // every few heartbeats, save to NVS
+
+    while (1) {
+        time_t now;
+        struct tm timeinfo;
+        time(&now);
+        localtime_r(&now, &timeinfo);
+
+        ESP_LOGI(TAG,
+                 "Heartbeat %d | Time: %04d-%02d-%02d %02d:%02d:%02d | Unix: %ld | Heap: %u",
+                 ++heartbeat,
+                 timeinfo.tm_year + 1900,
+                 timeinfo.tm_mon + 1,
+                 timeinfo.tm_mday,
+                 timeinfo.tm_hour,
+                 timeinfo.tm_min,
+                 timeinfo.tm_sec,
+                 (long)now,
+                 (unsigned)esp_get_free_heap_size());
+
+        // Every 3 heartbeats (~60s if delay is 20s), save Unix time to NVS
+        nvs_counter++;
+        if (nvs_counter >= 3) {
+            nvs_counter = 0;
+            if (now > 0) {
+                nvs_save_unix_time(now);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20000));  // 20 seconds
+    }
+}
+DS1307.c
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <time.h>
+#include "esp_log.h"
+#include "esp_err.h"
+#include "driver/i2c.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "ds1307.h"
+
+#define DS1307_TAG        "DS1307"
+
+#define DS1307_I2C_PORT   I2C_NUM_0
+#define DS1307_SDA_GPIO   8
+#define DS1307_SCL_GPIO   9
+#define DS1307_ADDR       0x68
+
+#define DS1307_REG_SECONDS 0x00
+
+static const char *TAG = DS1307_TAG;
+
+static bool s_i2c_initialized = false;
+
+static uint8_t dec2bcd(uint8_t val)
+{
+    return ((val / 10) << 4) | (val % 10);
+}
+
+static uint8_t bcd2dec(uint8_t val)
+{
+    return (uint8_t)((val >> 4) * 10 + (val & 0x0F));
+}
+
+esp_err_t ds1307_init(void)
+{
+    esp_err_t err;
+
+    if (!s_i2c_initialized) {
+        ESP_LOGI(TAG, "Initializing DS1307 I2C, SDA=%d SCL=%d", DS1307_SDA_GPIO, DS1307_SCL_GPIO);
+
+        i2c_config_t conf = {
+            .mode = I2C_MODE_MASTER,
+            .sda_io_num = DS1307_SDA_GPIO,
+            .scl_io_num = DS1307_SCL_GPIO,
+            .sda_pullup_en = GPIO_PULLUP_ENABLE,
+            .scl_pullup_en = GPIO_PULLUP_ENABLE,
+            .master.clk_speed = 100000,
+        };
+
+        err = i2c_param_config(DS1307_I2C_PORT, &conf);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "i2c_param_config failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        err = i2c_driver_install(DS1307_I2C_PORT, conf.mode, 0, 0, 0);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "i2c_driver_install failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        s_i2c_initialized = true;
+    } else {
+        ESP_LOGD(TAG, "I2C already initialized, skipping re-init");
+    }
+
+    // Ping DS1307: read 1 byte from register 0x00
+    uint8_t reg = DS1307_REG_SECONDS;
+    uint8_t data = 0;
+
+    err = i2c_master_write_read_device(DS1307_I2C_PORT,
+                                       DS1307_ADDR,
+                                       &reg, 1,
+                                       &data, 1,
+                                       1000 / portTICK_PERIOD_MS);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DS1307 not responding: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "DS1307 init complete");
+    return ESP_OK;
+}
+
+esp_err_t ds1307_get_time(struct tm *timeinfo)
+{
+    if (!timeinfo) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t reg = DS1307_REG_SECONDS;
+    uint8_t data[7] = {0};
+
+    esp_err_t err = i2c_master_write_read_device(DS1307_I2C_PORT,
+                                                 DS1307_ADDR,
+                                                 &reg, 1,
+                                                 data, 7,
+                                                 1000 / portTICK_PERIOD_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read time from DS1307: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint8_t seconds = bcd2dec(data[0] & 0x7F);  // bit7 = CH (clock halt)
+    uint8_t minutes = bcd2dec(data[1] & 0x7F);
+
+    uint8_t hour_reg = data[2];
+    uint8_t hours;
+    if (hour_reg & 0x40) {
+        // 12-hour mode
+        hours = bcd2dec(hour_reg & 0x1F);
+        bool pm = hour_reg & 0x20;
+        if (pm && hours < 12) {
+            hours += 12;
+        }
+        if (!pm && hours == 12) {
+            hours = 0;
+        }
+    } else {
+        // 24-hour mode
+        hours = bcd2dec(hour_reg & 0x3F);
+    }
+
+    uint8_t day    = bcd2dec(data[4]);
+    uint8_t month  = bcd2dec(data[5]);
+    uint8_t year   = bcd2dec(data[6]);  // 0-99, offset from 2000
+
+    memset(timeinfo, 0, sizeof(struct tm));
+    timeinfo->tm_sec  = seconds;
+    timeinfo->tm_min  = minutes;
+    timeinfo->tm_hour = hours;
+    timeinfo->tm_mday = day;
+    timeinfo->tm_mon  = month - 1;         // tm_mon: 0-11
+    timeinfo->tm_year = year + 100;        // tm_year: years since 1900, so 100 = 2000
+
+    return ESP_OK;
+}
+
+esp_err_t ds1307_set_time(const struct tm *timeinfo)
+{
+    if (!timeinfo) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t data[8];
+    data[0] = DS1307_REG_SECONDS;
+
+    // Clear CH bit (bit 7) to start oscillator
+    data[1] = dec2bcd(timeinfo->tm_sec & 0x7F);
+    data[2] = dec2bcd(timeinfo->tm_min & 0x7F);
+    data[3] = dec2bcd(timeinfo->tm_hour & 0x3F);  // 24-hour mode
+
+    // Day of week (not really used here, set 1..7 arbitrarily)
+    data[4] = 1;
+
+    data[5] = dec2bcd(timeinfo->tm_mday);
+    data[6] = dec2bcd((timeinfo->tm_mon + 1) & 0x1F);
+
+    int year = timeinfo->tm_year + 1900;  // convert from offset
+    if (year < 2000) year = 2000;
+    data[7] = dec2bcd((uint8_t)(year - 2000));
+
+    esp_err_t err = i2c_master_write_to_device(DS1307_I2C_PORT,
+                                               DS1307_ADDR,
+                                               data, sizeof(data),
+                                               1000 / portTICK_PERIOD_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set time on DS1307: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "RTC updated: %04d-%02d-%02d %02d:%02d:%02d",
+             year,
+             timeinfo->tm_mon + 1,
+             timeinfo->tm_mday,
+             timeinfo->tm_hour,
+             timeinfo->tm_min,
+             timeinfo->tm_sec);
+
+    return ESP_OK;
+}
+
+DS1307.h
+#pragma once
+
+#include <time.h>
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// I2C settings for DS1307
+#define DS1307_I2C_PORT        I2C_NUM_0
+#define DS1307_I2C_SDA_GPIO    8
+#define DS1307_I2C_SCL_GPIO    9
+#define DS1307_I2C_FREQ_HZ     100000
+#define DS1307_I2C_ADDR        0x68
+
+esp_err_t ds1307_init(void);
+
+/**
+ * @brief Write time into DS1307 from struct tm (local time).
+ */
+esp_err_t ds1307_set_time(const struct tm *timeinfo);
+
+/**
+ * @brief Read time from DS1307 into struct tm.
+ */
+esp_err_t ds1307_get_time(struct tm *timeinfo);
+
+/**
+ * @brief Quick validity check: returns true if tm_year >= 2020.
+ */
+bool ds1307_time_is_valid(const struct tm *timeinfo);
+
+#ifdef __cplusplus
+}
+#endif
+
+nvs_utils.h
+// main/nvs_utils.h
+#pragma once
+#include "esp_err.h"
+#include <stdint.h>
+
+esp_err_t nvs_utils_save_last_unix(uint64_t unix_ts);
+esp_err_t nvs_utils_load_last_unix(uint64_t *unix_ts_out);
+
+
+nvs_utils.c
+// main/nvs_utils.c
+#include "sdkconfig.h"
+#include "nvs_utils.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+
+static const char *TAG = "NVS_UTILS";
+#define NAMESPACE "rtc_backup"
+#define KEY_LAST "last_unix"
+
+esp_err_t nvs_utils_save_last_unix(uint64_t unix_ts)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed");
+        return err;
+    }
+    err = nvs_set_u64(h, KEY_LAST, unix_ts);
+    if (err == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t nvs_utils_load_last_unix(uint64_t *unix_ts_out)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    uint64_t val = 0;
+    err = nvs_get_u64(h, KEY_LAST, &val);
+    if (err == ESP_OK && unix_ts_out) *unix_ts_out = val;
+    nvs_close(h);
+    return err;
+}
+
+wifi_connect.h
+#pragma once
+
+void wifi_init_sta(void);
+
+
+wificredentials.h
+#pragma once
+
+// <-- CHANGE THESE to your network credentials before building
+#define WIFI_SSID "Infrared_4G"
+#define WIFI_PASS "6350307882"
+
+
+wifi_connects.c
+#include "sdkconfig.h"
+#include <string.h>              // ✅ add this
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "wifi_connect.h"
+
+
+static const char *TAG = "wifi_connect";
+
+static void wifi_event_handler(void *arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Disconnected. Reconnecting...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *evt = (ip_event_got_ip_t *) event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&evt->ip_info.ip));
+    }
+}
+
+void wifi_init_sta(void)
+{
+    ESP_LOGI(TAG, "Starting WiFi...");
+
+    // NVS init (WiFi requires this)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    // Register WiFi & IP events
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT,
+        ESP_EVENT_ANY_ID,
+        &wifi_event_handler,
+        NULL,
+        NULL));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT,
+        IP_EVENT_STA_GOT_IP,
+        &wifi_event_handler,
+        NULL,
+        NULL));
+
+    wifi_config_t wifi_config = { 0 };
+    strncpy((char *)wifi_config.sta.ssid, "Infrared_4G", sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, "6350307882", sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi init done.");
+}
