@@ -1,0 +1,99 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_err.h"
+
+#include "driver/spi_common.h"
+#include "driver/sdspi_host.h"
+#include "sdmmc_cmd.h"
+#include "esp_vfs_fat.h"
+#define TAG "SD_FINAL"
+
+// ✅ YOUR FIXED PINS
+#define PIN_MOSI 11
+#define PIN_MISO 13
+#define PIN_SCK  12
+#define PIN_CS   10   // ⚠️ MUST BE BUFFERED
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting SD Card File Save Test...");
+
+    esp_err_t ret;
+
+    // ✅ SPI HOST CONFIG (SPI2)
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI2_HOST;
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_MOSI,
+        .miso_io_num = PIN_MISO,
+        .sclk_io_num = PIN_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+
+    ESP_LOGI(TAG, "Initializing SPI2 bus...");
+    ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI Bus Init Failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    // ✅ SD DEVICE CONFIG
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_CS;
+    slot_config.host_id = host.slot;
+
+    // ✅ FAT FILESYSTEM MOUNT CONFIG
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+
+    sdmmc_card_t *card;
+
+    ESP_LOGI(TAG, "Mounting SD card at /sdcard...");
+    ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SD Card Mount Failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "SD Card Mounted Successfully ✅");
+
+    // ✅ WRITE FILE
+    ESP_LOGI(TAG, "Writing file...");
+    FILE *f = fopen("/sdcard/test.txt", "w");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+        return;
+    }
+
+    const char *msg = "ESP32-S3 SD Card File Write SUCCESS ✅\n";
+    fwrite(msg, 1, strlen(msg), f);
+    fclose(f);
+
+    ESP_LOGI(TAG, "File written successfully ✅");
+
+    // ✅ READ FILE
+    ESP_LOGI(TAG, "Reading file...");
+    f = fopen("/sdcard/test.txt", "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+        return;
+    }
+
+    char read_buf[128];
+    fgets(read_buf, sizeof(read_buf), f);
+    fclose(f);
+
+    ESP_LOGI(TAG, "File Content: %s", read_buf);
+
+    ESP_LOGI(TAG, "SD Card File Test COMPLETE ✅");
+}
