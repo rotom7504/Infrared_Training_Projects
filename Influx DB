@@ -1,0 +1,188 @@
+main.c 
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <inttypes.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_log.h"
+#include "esp_http_client.h"
+#include "esp_sntp.h"
+#include "esp_crt_bundle.h"
+
+/* Provided by your wifi_connect.c */
+void wifi_connect_sta(void);
+
+static const char *TAG = "MAIN";
+
+/* ---------- SNTP (UTC) ---------- */
+static void obtain_time(void)
+{
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+
+    time_t now = 0;
+    while (now < 1700000000) {   // sanity check: year ~2023+
+        ESP_LOGI(TAG, "Waiting for SNTP time sync...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        time(&now);
+    }
+
+    ESP_LOGI(TAG, "SNTP synced");
+}
+
+/* ---------- Round epoch to exact minute ---------- */
+static time_t round_to_minute(time_t t)
+{
+    return (t / 60) * 60;   // seconds -> HH:MM:00
+}
+
+/* ---------- InfluxDB send ---------- */
+static void send_to_influx(uint8_t slave_id, float temperature, float humidity)
+{
+    time_t now;
+    time(&now);
+
+    time_t epoch = round_to_minute(now);
+
+    ESP_LOGI(TAG, "UTC epoch (rounded): %" PRId64, (int64_t)epoch);
+
+    /* -------- Line Protocol --------
+       measurement,tag=value field=value,field=value timestamp
+    */
+    char lp[256];
+    snprintf(lp, sizeof(lp),
+             "raghav,slave_id=%u temperature=%.2f,humidity=%.2f %" PRId64,
+             slave_id,
+             temperature,
+             humidity,
+             (int64_t)epoch);
+
+    ESP_LOGI(TAG, "LP => %s", lp);
+
+    esp_http_client_config_t config = {
+        .url = "https://us-east-1-1.aws.cloud2.influxdata.com/api/v2/write?org=Test_Infrared&bucket=AggregatedData&precision=s",
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 20000,
+        .crt_bundle_attach = esp_crt_bundle_attach,   // 🔐 REQUIRED
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    esp_http_client_set_header(
+        client,
+        "Authorization",
+        "Token HD2iQoc-VzgTH9SJh6RP2564WY23qGIkP7EiXZ6gPSaiu8bb_YwNl8jS8mkGi4mhrYXI2diPJNqFMCWQS-WQLg=="
+    );
+    esp_http_client_set_header(client, "Content-Type", "text/plain");
+    esp_http_client_set_header(client, "Connection", "close");
+
+    esp_http_client_set_post_field(client, lp, strlen(lp));
+
+    esp_err_t err = esp_http_client_perform(client);
+
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        if (status == 204) {
+            ESP_LOGI(TAG, "Influx write SUCCESS (204)");
+        } else {
+            ESP_LOGE(TAG, "Influx rejected, HTTP %d", status);
+        }
+    } else {
+        ESP_LOGE(TAG, "HTTP error: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+}
+
+/* ---------- app_main ---------- */
+void app_main(void)
+{
+    ESP_LOGI(TAG, "App start");
+
+    wifi_connect_sta();   // already implemented by you
+    obtain_time();        // SNTP UTC sync
+
+    /* Example values (replace with real Modbus sensor data) */
+    uint8_t slave_id   = 1;
+    float temperature = 26.5;
+    float humidity    = 55.2;
+
+    send_to_influx(slave_id, temperature, humidity);
+
+    ESP_LOGI(TAG, "Done");
+}
+
+wifi_connect.c
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+
+#define WIFI_CONNECTED_BIT BIT0
+
+static const char *TAG = "wifi";
+static EventGroupHandle_t wifi_event_group;
+
+static void wifi_event_handler(void *arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT &&
+               event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGW(TAG, "Retrying WiFi...");
+    } else if (event_base == IP_EVENT &&
+               event_id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "WiFi connected");
+    }
+}
+
+void wifi_connect_sta(void)
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
+
+    wifi_event_group = xEventGroupCreate();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "Infrared_4G",
+            .password = "6350307882",
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    xEventGroupWaitBits(wifi_event_group,
+                        WIFI_CONNECTED_BIT,
+                        pdFALSE,
+                        pdTRUE,
+                        portMAX_DELAY);
+}
+
