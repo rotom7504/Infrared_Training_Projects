@@ -338,6 +338,7 @@ void http_server_start(void)
 #include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
 
 #include "device_identity.h"
 #include "security.h"
