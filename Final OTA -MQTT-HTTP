@@ -329,124 +329,142 @@ void http_server_start(void)
 }
 
 
+#include <stdio.h>
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 
 #include "device_identity.h"
+#include "security.h"
+#include "reliability.h"
 #include "wifi_manager.h"
 #include "time_sync.h"
 #include "mqtt_app.h"
 #include "http_server.h"
-#include "reliability.h"
-#include "security.h"
+#include "ota_manager.h"
 
-static const char *TAG = "MAIN";
+#define TAG "MAIN"
 
-/* ---------------- OTA POST-BOOT VALIDATION ---------------- */
+/* =========================
+ * GPIO STATUS INDICATOR
+ * ========================= */
+#define WIFI_LED_GPIO 15
 
-static void ota_validation_task(void *arg)
+static void led_init(void)
 {
-    ESP_LOGI(TAG, "OTA validation task running");
-
-    /* Grace window for system to stabilize */
-    vTaskDelay(pdMS_TO_TICKS(20000));
-
-    bool time_ok = time_sync_is_valid();
-    bool mqtt_ok = mqtt_is_connected();
-
-    ESP_LOGI(TAG, "OTA validation: time=%d mqtt=%d",
-             time_ok, mqtt_ok);
-
-    if (time_ok && mqtt_ok) {
-        ESP_LOGW(TAG, "AUDIT: OTA image marked VALID");
-        esp_ota_mark_app_valid_cancel_rollback();
-    } else {
-        ESP_LOGE(TAG, "AUDIT: OTA validation failed → rollback on reboot");
-    }
-
-    vTaskDelete(NULL);
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << WIFI_LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io);
+    gpio_set_level(WIFI_LED_GPIO, 0);   // OFF at boot
 }
 
-/* ---------------- APP MAIN ---------------- */
-
+/* =========================
+ * MAIN APPLICATION
+ * ========================= */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "System boot");
+    ESP_LOGI(TAG, "==============================");
+    ESP_LOGI(TAG, " SYSTEM BOOT STARTED ");
+    ESP_LOGI(TAG, "==============================");
 
-    /* ---------------- NVS ---------------- */
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    /* ---------- NVS INIT ---------- */
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    /* ---------------- IDENTITY ---------------- */
+    /* ---------- LED ---------- */
+    led_init();
+
+    /* ---------- DEVICE ID ---------- */
     device_identity_init();
 
-    /* ---------------- RELIABILITY ---------------- */
+    /* ---------- RELIABILITY ---------- */
     reliability_init();
 
-    /* ---------------- SECURITY AUDIT ---------------- */
-    security_init();
+    /* ---------- SECURITY CHECKS ---------- */
+    security_run_audit();
 
-    /* ---------------- SAFE MODE BRANCH ---------------- */
+    /* ============================================================
+     * SAFE MODE CHECK
+     * ============================================================ */
     if (reliability_is_safe_mode()) {
-        ESP_LOGE(TAG, "SAFE MODE ACTIVE");
 
+        ESP_LOGE(TAG, "================================");
+        ESP_LOGE(TAG, " SAFE MODE ACTIVE ");
+        ESP_LOGE(TAG, "================================");
+
+        /* LED BLINK = SAFE MODE */
+        gpio_set_level(WIFI_LED_GPIO, 1);
+
+        /* Only AP + HTTP allowed */
         wifi_manager_start_ap_only();
         http_server_start();
 
-        /* Recovery-only loop */
+        ESP_LOGW(TAG, "Recovery services active");
+        ESP_LOGW(TAG, "Waiting for manual intervention");
+
+        /* Recovery loop */
         while (true) {
-            vTaskDelay(pdMS_TO_TICKS(10000));
+            reliability_feed();          // ✅ watchdog fed
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
-    /* ---------------- NORMAL MODE ---------------- */
+    /* ============================================================
+     * NORMAL MODE
+     * ============================================================ */
+    ESP_LOGI(TAG, "Normal mode start");
 
-    /* OTA state check */
-    const esp_partition_t *running =
-        esp_ota_get_running_partition();
-    esp_ota_img_states_t state;
-
-    if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
-        state == ESP_OTA_IMG_PENDING_VERIFY) {
-
-        ESP_LOGW(TAG, "Running PENDING OTA image");
-        xTaskCreate(
-            ota_validation_task,
-            "ota_validate",
-            4096,
-            NULL,
-            5,
-            NULL
-        );
-    }
-
-    /* WiFi AP + STA */
+    /* ---------- WIFI ---------- */
     wifi_manager_start();
 
-    /* SNTP (mandatory for TLS) */
+    /* ---------- TIME SYNC ---------- */
     time_sync_start();
 
-    /* MQTT (secure TLS) */
+    /* ---------- OTA STATE CHECK ---------- */
+    ota_manager_check_state();
+
+    /* ---------- MQTT ---------- */
     mqtt_app_start();
 
-    /* HTTP REST */
+    /* ---------- HTTP SERVER ---------- */
     http_server_start();
 
-    ESP_LOGI(TAG, "System fully operational");
+    /* ---------- SYSTEM READY ---------- */
+    gpio_set_level(WIFI_LED_GPIO, 1);
+    reliability_mark_healthy();
 
+    ESP_LOGI(TAG, "================================");
+    ESP_LOGI(TAG, " SYSTEM FULLY OPERATIONAL ");
+    ESP_LOGI(TAG, "================================");
+
+    /* ============================================================
+     * MAIN LOOP (IDLE SAFE)
+     * ============================================================ */
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        /* NOTE:
+         * Main task is NOT attached to watchdog.
+         * No need to feed WDT here.
+         */
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
+
 
 
 #pragma once
@@ -785,66 +803,90 @@ void ota_manager_start(void)
 
 #pragma once
 
+#include "esp_system.h"
+#include "esp_err.h"
 #include <stdbool.h>
 
-/* Initialize reliability systems (boot guard + watchdog) */
+/* Initialize reliability system */
 void reliability_init(void);
 
-/* Feed task watchdog (optional periodic call) */
+/* Feed watchdog (used only where needed) */
 void reliability_feed(void);
 
-/* Check if system is in SAFE MODE */
+/* Boot counter */
+uint32_t reliability_get_boot_count(void);
+
+/* Safe mode detection */
 bool reliability_is_safe_mode(void);
 
-/* Print last reset reason */
-void reliability_print_reset_reason(void);
+/* Mark system as healthy (used after OTA validation etc.) */
+void reliability_mark_healthy(void);
+
 
 
 #include "reliability.h"
 
 #include "esp_log.h"
-#include "esp_system.h"
 #include "esp_task_wdt.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
-static const char *TAG = "RELIABILITY";
+#define TAG "RELIABILITY"
 
-/* RTC retained across resets */
-RTC_DATA_ATTR static uint32_t boot_count = 0;
-RTC_DATA_ATTR static bool safe_mode = false;
+#define NVS_NAMESPACE "reliability"
+#define BOOT_COUNT_KEY "boot_cnt"
+#define HEALTHY_KEY    "healthy"
 
-#define BOOT_FAIL_THRESHOLD 3
+#define WDT_TIMEOUT_SEC 10
 
-/* ---------------- RESET REASON ---------------- */
+static uint32_t boot_count = 0;
+static bool safe_mode = false;
 
-void reliability_print_reset_reason(void)
+void reliability_init(void)
 {
-    esp_reset_reason_t reason = esp_reset_reason();
+    esp_err_t err;
 
-    const char *reason_str = "UNKNOWN";
-    switch (reason) {
-        case ESP_RST_POWERON:  reason_str = "POWERON"; break;
-        case ESP_RST_EXT:      reason_str = "EXTERNAL"; break;
-        case ESP_RST_SW:       reason_str = "SOFTWARE"; break;
-        case ESP_RST_PANIC:    reason_str = "PANIC"; break;
-        case ESP_RST_TASK_WDT: reason_str = "TASK_WDT"; break;
-        case ESP_RST_INT_WDT:  reason_str = "INT_WDT"; break;
-        case ESP_RST_WDT:      reason_str = "WDT"; break;
-        case ESP_RST_BROWNOUT: reason_str = "BROWNOUT"; break;
-        default: break;
+    /* Initialize Task Watchdog */
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WDT_TIMEOUT_SEC * 1000,
+        .idle_core_mask = 0,   // ❗ Do NOT watch IDLE tasks
+        .trigger_panic = false
+    };
+
+    esp_task_wdt_init(&wdt_config);
+
+    /* ❌ DO NOT attach MAIN TASK to WDT */
+    /* esp_task_wdt_add(NULL);  <-- REMOVED ON PURPOSE */
+
+    /* Open NVS */
+    nvs_handle_t nvs;
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed");
+        return;
     }
 
-    ESP_LOGW(TAG, "RESET_REASON: %s (%d)", reason_str, reason);
-}
+    /* Read boot count */
+    nvs_get_u32(nvs, BOOT_COUNT_KEY, &boot_count);
+    boot_count++;
+    nvs_set_u32(nvs, BOOT_COUNT_KEY, boot_count);
 
-/* ---------------- WATCHDOG ---------------- */
+    /* Read health flag */
+    uint8_t healthy = 0;
+    nvs_get_u8(nvs, HEALTHY_KEY, &healthy);
 
-static void watchdog_attach(void)
-{
-    /* Watchdog already initialized by ESP-IDF */
-    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
-    ESP_LOGI(TAG, "Task watchdog attached");
+    if (healthy == 0 && boot_count >= 3) {
+        safe_mode = true;
+        ESP_LOGW(TAG, "SAFE MODE TRIGGERED");
+    }
+
+    /* Clear health flag for next boot */
+    nvs_set_u8(nvs, HEALTHY_KEY, 0);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    ESP_LOGW(TAG, "RESET_REASON: %d", esp_reset_reason());
+    ESP_LOGW(TAG, "BOOT COUNT: %lu", boot_count);
 }
 
 void reliability_feed(void)
@@ -852,31 +894,25 @@ void reliability_feed(void)
     esp_task_wdt_reset();
 }
 
-/* ---------------- BOOT GUARD ---------------- */
-
-static void boot_guard_check(void)
+uint32_t reliability_get_boot_count(void)
 {
-    boot_count++;
-    ESP_LOGW(TAG, "BOOT COUNT: %lu", boot_count);
-
-    if (boot_count >= BOOT_FAIL_THRESHOLD) {
-        safe_mode = true;
-        ESP_LOGE(TAG, "AUDIT: SAFE MODE ENTERED");
-    }
+    return boot_count;
 }
-
-/* ---------------- PUBLIC API ---------------- */
 
 bool reliability_is_safe_mode(void)
 {
     return safe_mode;
 }
 
-void reliability_init(void)
+void reliability_mark_healthy(void)
 {
-    reliability_print_reset_reason();
-    boot_guard_check();
-    watchdog_attach();
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, HEALTHY_KEY, 1);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "System marked healthy");
+    }
 }
 
 
