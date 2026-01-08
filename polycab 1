@@ -1,0 +1,187 @@
+#include "modbus_master.h"
+#include "modbus_crc.h"
+#include "alarm_engine.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include <stdint.h>
+#include <stdint.h>
+
+#define TAG "INV_MODBUS"
+
+/* UART CONFIG */
+#define UART_PORT UART_NUM_2
+#define TXD_PIN   18
+#define RXD_PIN   17
+#define BAUDRATE  9600
+#define SLAVE_ID  0x02
+
+int modbus_read_04(uint16_t reg, uint16_t qty, uint8_t *resp);
+
+static double esp_energy_kwh = 0.0;
+static int64_t last_energy_ts = 0;
+
+/* ---------------- UART INIT ---------------- */
+
+static void uart_init(void)
+{
+    uart_config_t cfg = {
+        .baud_rate = BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_param_config(UART_PORT, &cfg);
+    uart_set_pin(UART_PORT, TXD_PIN, RXD_PIN,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_PORT, 2048, 0, 0, NULL, 0);
+}
+
+esp_err_t inverter_modbus_init(void)
+{
+    uart_init();
+    ESP_LOGI(TAG,"PolyCab Inverter Monitor Started");
+    return ESP_OK;
+}
+
+/* ---------------- MODBUS READ 0x04 ---------------- */
+
+//static int modbus_read_04(uint16_t reg, uint16_t qty, uint8_t *resp)
+//{
+   // uint8_t req[8];
+   // req[0]=SLAVE_ID; req[1]=0x04;
+    //req[2]=reg>>8; req[3]=reg&0xFF;
+  //  req[4]=qty>>8; req[5]=qty&0xFF;
+
+  ///  uint16_t crc = modbus_crc16(req,6);
+   // req[6]=crc&0xFF; req[7]=crc>>8;
+
+   /// uart_flush_input(UART_PORT);
+   //uart_write_bytes(UART_PORT,(char*)req,8);
+   // uart_wait_tx_done(UART_PORT,pdMS_TO_TICKS(30));
+   // return uart_read_bytes(UART_PORT,resp,64,pdMS_TO_TICKS(250));
+//}
+
+/* ---------------- ACTIVE POWER ---------------- */
+
+void inv_read_basic_block(void)
+{
+    uint8_t r[16];
+    if(modbus_read_04(3005-1,2,r) < 9) return;
+
+    int32_t raw =
+        ((int32_t)r[3]<<24)|((int32_t)r[4]<<16)|
+        ((int32_t)r[5]<<8)|r[6];
+
+    float pac_kw = raw * 0.1f;
+    ESP_LOGI(TAG,"P_AC = %.2f kW", pac_kw);
+
+    int64_t now = esp_timer_get_time();
+    if(last_energy_ts){
+        double dt_hr = (now - last_energy_ts)/3600000000.0;
+        esp_energy_kwh += pac_kw * dt_hr;
+    }
+    last_energy_ts = now;
+}
+
+/* ---------------- ENERGY TODAY ---------------- */
+
+void inv_read_energy_block(void)
+{
+    uint8_t r[16];
+    if(modbus_read_04(3055-1,2,r) < 9) return;
+
+    uint32_t raw =
+        ((uint32_t)r[3]<<24)|((uint32_t)r[4]<<16)|
+        ((uint32_t)r[5]<<8)|r[6];
+
+    ESP_LOGI(TAG,"E_Day = %.2f kWh | Live=%.3f kWh", raw*0.1f, esp_energy_kwh);
+}
+
+/* ---------------- TOTAL ENERGY ---------------- */
+
+void inv_read_total_energy(void)
+{
+    uint8_t r[16];
+    if(modbus_read_04(3007-1,2,r) < 9) return;
+
+    uint32_t raw =
+        ((uint32_t)r[3]<<24)|((uint32_t)r[4]<<16)|
+        ((uint32_t)r[5]<<8)|r[6];
+
+    ESP_LOGI(TAG,"E_TOTAL = %lu kWh", raw);
+}
+
+/* ---------------- DC POWER ---------------- */
+
+void inv_read_dc_block(void)
+{
+    uint8_t r[20];
+    if(modbus_read_04(3022-1,4,r) < 13) return;
+
+    float v1=((r[3]<<8)|r[4])*0.1f;
+    float i1=((int16_t)((r[5]<<8)|r[6]))*0.1f;
+    float v2=((r[7]<<8)|r[8])*0.1f;
+    float i2=((int16_t)((r[9]<<8)|r[10]))*0.1f;
+
+    ESP_LOGI(TAG,"V_DC1=%.1f I_DC1=%.1f | V_DC2=%.1f I_DC2=%.1f | P_DC=%.3f kW",
+             v1,i1,v2,i2,(v1*i1+v2*i2)/1000.0f);
+}
+
+/* ---------------- GRID ---------------- */
+
+void inv_read_grid_block(void)
+{
+    uint8_t r[32];
+    if(modbus_read_04(3034-1,6,r) < 17) return;
+
+    float vr=((r[3]<<8)|r[4])*0.1f;
+    float vy=((r[5]<<8)|r[6])*0.1f;
+    float vb=((r[7]<<8)|r[8])*0.1f;
+    float ir=((r[9]<<8)|r[10])*0.1f;
+    float iy=((r[11]<<8)|r[12])*0.1f;
+    float ib=((r[13]<<8)|r[14])*0.1f;
+
+    if(modbus_read_04(3043-1,1,r) < 7) return;
+    float f=((r[3]<<8)|r[4])*0.01f;
+
+    ESP_LOGI(TAG,"V_AC=%.1f %.1f %.1f | I_AC=%.1f %.1f %.1f | F=%.2f",
+             vr,vy,vb,ir,iy,ib,f);
+}
+
+/* ---------------- Q & S POWER ---------------- */
+
+void inv_read_qs_block(void)
+{
+    uint8_t r[16];
+    if(modbus_read_04(3011-1,2,r) < 9) return;
+
+    int32_t q = ((int32_t)r[3]<<24)|((int32_t)r[4]<<16)|
+                ((int32_t)r[5]<<8)|r[6];
+
+    if(modbus_read_04(3013-1,2,r) < 9) return;
+
+    int32_t s = ((int32_t)r[3]<<24)|((int32_t)r[4]<<16)|
+                ((int32_t)r[5]<<8)|r[6];
+
+    ESP_LOGI(TAG,"Q_AC=%.2f kvar | S_AC=%.2f kVA", q*0.1f, s*0.1f);
+}
+
+/* ---------------- TEMPERATURE ---------------- */
+
+void inv_read_temp(void)
+{
+    uint8_t r[8];
+    if(modbus_read_04(3101-1,1,r) < 7) return;
+    ESP_LOGI(TAG,"TEMP_001=%.1f C", ((int16_t)((r[3]<<8)|r[4]))*0.1f);
+}
+
+/* ---------------- STATUS ---------------- */
+
+void inv_read_status_block(void)
+{
+    uint8_t r[8];
+    if(modbus_read_04(3201-1,1,r) < 7) return;
+    ESP_LOGI(TAG,"STATUS=%u",(r[3]<<8)|r[4]);
+}
