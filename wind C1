@@ -1,0 +1,91 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_adc/adc_oneshot.h"
+
+#define TAG "WIND"
+
+/* ===== ADC CONFIG ===== */
+#define SENSOR_ADC_UNIT ADC_UNIT_1
+#define SENSOR_ADC_CH   ADC_CHANNEL_0
+#define ADC_ATTEN       ADC_ATTEN_DB_12
+#define ADC_WIDTH       ADC_BITWIDTH_12
+
+#define ADC_MAX_VALUE   4095.0f
+#define ADC_REF_VOLTAGE 3.3f
+
+/* ===== CALIBRATION ===== */
+#define V_4MA   0.82f     // true idle voltage (adjust if needed)
+#define V_20MA  2.90f     // update after max airflow test
+#define WIND_MAX_MPS 30.0f
+
+#define SAMPLE_COUNT 256
+#define DEAD_ZONE_MPS 0.0f   // disable during calibration
+
+static adc_oneshot_unit_handle_t adc_handle;
+
+/* ===== ADC INIT ===== */
+static void adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = SENSOR_ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE
+    };
+    adc_oneshot_new_unit(&unit_cfg, &adc_handle);
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_WIDTH
+    };
+    adc_oneshot_config_channel(adc_handle, SENSOR_ADC_CH, &chan_cfg);
+}
+
+/* ===== READ WIND SPEED ===== */
+static float read_wind_speed(float *out_voltage)
+{
+    int raw_sum = 0;
+
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        int raw;
+        adc_oneshot_read(adc_handle, SENSOR_ADC_CH, &raw);
+        raw_sum += raw;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    float raw_avg = raw_sum / SAMPLE_COUNT;
+    float voltage = (raw_avg / ADC_MAX_VALUE) * ADC_REF_VOLTAGE;
+
+    if (out_voltage) *out_voltage = voltage;
+
+    if (voltage < V_4MA) voltage = V_4MA;
+    if (voltage > V_20MA) voltage = V_20MA;
+
+    float wind = (voltage - V_4MA) * (WIND_MAX_MPS / (V_20MA - V_4MA));
+
+    if (wind < DEAD_ZONE_MPS)
+        wind = 0.0f;
+
+    if (wind > WIND_MAX_MPS)
+        wind = WIND_MAX_MPS;
+
+    return wind;
+}
+
+/* ===== MAIN ===== */
+void app_main(void)
+{
+    adc_init();
+    ESP_LOGI(TAG, "SN-3000 Wind Sensor Calibrating");
+
+    while (1) {
+        float voltage = 0;
+        float wind = read_wind_speed(&voltage);
+
+        ESP_LOGI(TAG,
+            "ADC Voltage = %.3f V | Wind Speed = %.2f m/s",
+            voltage, wind);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
